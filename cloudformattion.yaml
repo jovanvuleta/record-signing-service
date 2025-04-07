@@ -1,0 +1,371 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Record Signing Service Infrastructure'
+
+Parameters:
+  DBSecretArn:
+    Type: String
+    Default: AddHereDbSecretArnOnceCreated
+    Description: ARN of the secret containing database credentials
+
+  BatchSize:
+    Type: Number
+    Default: 10000
+    Description: Number of records to process in each batch
+
+  Concurrency:
+    Type: Number
+    Default: 10
+    Description: Number of concurrent batches to process
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+  DeploymentBucket:
+    Type: String
+    Description: S3 bucket where the Lambda deployment package is stored
+
+  DeploymentPackageKey:
+    Type: String
+    Default: deployment-package.zip
+    Description: S3 key for the Lambda deployment package
+
+  NotificationEmail:
+    Type: String
+    Default: 'youremailhere@gmail.com'
+    Description: Email address to receive completion notifications (optional)
+
+Resources:
+  # DynamoDB Table for Key Usage
+  KeyUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-key-usage
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: key_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: key_id
+          KeyType: HASH
+
+  # SNS Topic for Completion Notifications
+  CompletionNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-completion-notifications
+      DisplayName: !Sub ${AWS::StackName} Record Signing Completion Notifications
+
+  # SNS Subscription (optional, only created if NotificationEmail is provided)
+  CompletionNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref CompletionNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # SQS Queue
+  BatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-batch-queue
+      VisibilityTimeout: 300  # 5 minutes
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BatchQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  BatchQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-batch-queue-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess'
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource:
+                  - !GetAtt BatchQueue.Arn
+                  - !GetAtt BatchQueueDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource:
+                  - !Ref CompletionNotificationTopic
+              # Add DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt KeyUsageTable.Arn
+              # Add KMS permissions
+              - Effect: Allow
+                Action:
+                  - 'kms:CreateKey'
+                  - 'kms:CreateAlias'
+                  - 'kms:Sign'
+                  - 'kms:Verify'
+                  - 'kms:ListAliases'
+                  - 'kms:DescribeKey'
+                  - 'kms:GetPublicKey'
+                  - 'kms:TagResource'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref DBSecretArn
+
+  InitializerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-initializer
+      Handler: initializer.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref DeploymentPackageKey
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DEFAULT_BATCH_SIZE: !Ref BatchSize
+          DEFAULT_CONCURRENCY: !Ref Concurrency
+          ENVIRONMENT: !Ref Environment
+          KEY_USAGE_TABLE: !Ref KeyUsageTable
+          DB_SECRET_NAME: !Ref DBSecretArn
+
+  BatchProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-batch-processor
+      Handler: batch_processor.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref DeploymentPackageKey
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BATCH_SIZE: !Ref BatchSize
+          BATCH_QUEUE_URL: !Ref BatchQueue
+          ENVIRONMENT: !Ref Environment
+          KEY_USAGE_TABLE: !Ref KeyUsageTable
+          DB_SECRET_NAME: !Ref DBSecretArn
+
+  BatchSubmitterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-batch-submitter
+      Handler: batch_submitter.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref DeploymentPackageKey
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          DEFAULT_BATCH_SIZE: !Ref BatchSize
+          DEFAULT_CONCURRENCY: !Ref Concurrency
+          BATCH_QUEUE_URL: !Ref BatchQueue
+          PROCESSOR_FUNCTION_NAME: !Ref BatchProcessorLambda
+          DIRECT_INVOKE: 'false'
+          ENVIRONMENT: !Ref Environment
+          DB_SECRET_NAME: !Ref DBSecretArn
+
+  CheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-checker
+      Handler: checker.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref DeploymentPackageKey
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          DB_SECRET_NAME: !Ref DBSecretArn
+
+  FinalLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-finalizer
+      Handler: finalizer.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref DeploymentPackageKey
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          COMPLETION_SNS_TOPIC_ARN: !Ref CompletionNotificationTopic
+          DB_SECRET_NAME: !Ref DBSecretArn
+
+  # SQS Event Source Mapping
+  BatchQueueEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt BatchQueue.Arn
+      FunctionName: !GetAtt BatchProcessorLambda.Arn
+      Enabled: true
+      BatchSize: 10
+
+  # Step Functions State Machine
+  SigningStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-record-signing
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Record Signing Orchestration Workflow",
+          "StartAt": "Initialize",
+          "States": {
+            "Initialize": {
+              "Type": "Task",
+              "Resource": "${InitializerLambda.Arn}",
+              "Next": "CheckRemainingRecords",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "CheckRemainingRecords": {
+              "Type": "Task",
+              "Resource": "${CheckerLambda.Arn}",
+              "Next": "AreRecordsRemaining"
+            },
+            "AreRecordsRemaining": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.records_remaining",
+                  "NumericGreaterThan": 0,
+                  "Next": "SubmitBatches"
+                }
+              ],
+              "Default": "CompleteProcess"
+            },
+            "SubmitBatches": {
+              "Type": "Task",
+              "Resource": "${BatchSubmitterLambda.Arn}",
+              "Parameters": {
+                "execution_arn.$": "$$.Execution.Id",
+                "concurrency.$": "$.concurrency",
+                "batch_size.$": "$.batch_size"
+              },
+              "Next": "WaitForCompletion"
+            },
+            "WaitForCompletion": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckRemainingRecords"
+            },
+            "CompleteProcess": {
+              "Type": "Task",
+              "Resource": "${FinalLambda.Arn}",
+              "End": true
+            }
+          }
+        }
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt InitializerLambda.Arn
+                  - !GetAtt CheckerLambda.Arn
+                  - !GetAtt BatchSubmitterLambda.Arn
+                  - !GetAtt FinalLambda.Arn
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref SigningStateMachine
+
+  BatchQueueUrl:
+    Description: URL of the batch processing queue
+    Value: !Ref BatchQueue
+
+  CompletionNotificationTopicArn:
+    Description: ARN of the SNS topic for completion notifications
+    Value: !Ref CompletionNotificationTopic
+
+  KeyUsageTableName:
+    Description: Name of the DynamoDB table for key usage tracking
+    Value: !Ref KeyUsageTable

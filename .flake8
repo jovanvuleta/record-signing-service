@@ -1,0 +1,10 @@
+[flake8]
+ignore = E501,E402,E711,E712,E402,W505,W503
+
+exclude =
+    .git,
+    __pycache__,
+
+max-line-length=120
+max-doc-length=120
+max-complexity = 60

@@ -1,0 +1,15 @@
+black==23.7.0
+
+# AWS SDK
+boto3==1.37.27
+botocore==1.37.27
+flake8==6.1.0
+isort==5.12.0
+
+# Database
+pg8000==1.30.1
+
+# Development
+pre-commit===4.2.0
+# Env
+python-dotenv==1.1.0
